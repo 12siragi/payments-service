@@ -1,5 +1,6 @@
 import { db } from '../db/db.js';
 import { ProviderAlpha } from '../providers/providerAlpha.js';
+import { ProviderBeta } from '../providers/providerBeta.js';
 
 export const createCharge = async (req, res) => {
   const { amount, phoneNumber, currency, provider, requestId } = req.body;
@@ -35,6 +36,18 @@ export const createCharge = async (req, res) => {
     providerInstance.initiateCharge(charge)
       .catch(err => console.error('ProviderAlpha error:', err));
   }
+
+  if (provider === 'PROVIDER_ALPHA') {
+  const providerInstance = new ProviderAlpha();
+  providerInstance.initiateCharge(charge)
+    .catch(err => console.error('Alpha error:', err));
+}
+
+  if (provider === 'PROVIDER_BETA') {
+  const providerInstance = new ProviderBeta();
+  providerInstance.initiateCharge(charge)
+    .catch(err => console.error('Beta error:', err));
+}
 
   return res.json(charge);
 };
