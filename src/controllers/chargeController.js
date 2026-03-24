@@ -1,70 +1,86 @@
 import { db } from '../db/db.js';
-import { ProviderAlpha } from '../providers/providerAlpha.js';
-import { ProviderBeta } from '../providers/providerBeta.js';
+import { providerRegistry } from '../providers/providerRegistry.js';
 
+const REQUIRED_FIELDS = ['requestId', 'amount', 'phoneNumber', 'currency', 'provider'];
+
+// ----------------------------
+// CREATE CHARGE
+// ----------------------------
 export const createCharge = async (req, res) => {
-  const { amount, phoneNumber, currency, provider, requestId } = req.body;
+  try {
+    const { amount, phoneNumber, currency, provider, requestId } = req.body;
 
-  // 1️⃣ Idempotency: check if request exists
-  const existing = await db.get(
-    'SELECT * FROM charges WHERE requestId = ?',
-    requestId
-  );
+    // 1️⃣ Input validation
+    const missing = REQUIRED_FIELDS.filter(f => req.body[f] == null);
+    if (missing.length) {
+      return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
+    }
 
-  if (existing) return res.json(existing);
+    if (typeof amount !== 'number' || amount <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive number' });
+    }
 
-  // 2️⃣ Insert new charge as pending
-  await db.run(
-    `INSERT INTO charges (requestId, amount, phoneNumber, currency, provider, status)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    requestId,
-    amount,
-    phoneNumber,
-    currency,
-    provider,
-    'pending'
-  );
+    // 2️⃣ Validate provider before touching the DB
+    const ProviderClass = providerRegistry[provider];
+    if (!ProviderClass) {
+      return res.status(400).json({ error: `Unsupported provider: ${provider}` });
+    }
 
-  const charge = await db.get(
-    'SELECT * FROM charges WHERE requestId = ?',
-    requestId
-  );
+    // 3️⃣ Idempotency check
+    const existing = await db.get(
+      'SELECT * FROM charges WHERE requestId = ?',
+      requestId
+    );
+    if (existing) return res.json(existing);
 
-  // 3️⃣ Initiate with ProviderAlpha if chosen
-  if (provider === 'PROVIDER_ALPHA') {
-    const providerInstance = new ProviderAlpha();
-    providerInstance.initiateCharge(charge)
-      .catch(err => console.error('ProviderAlpha error:', err));
+    // 4️⃣ Insert new charge as pending (durability)
+    await db.run(
+      `INSERT INTO charges (requestId, amount, phoneNumber, currency, provider, status)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      requestId, amount, phoneNumber, currency, provider, 'pending'
+    );
+
+    const charge = await db.get(
+      'SELECT * FROM charges WHERE requestId = ?',
+      requestId
+    );
+
+    // 5️⃣ Fire-and-forget: respond in <300ms, provider runs in background
+    const instance = new ProviderClass();
+    instance.initiateCharge(charge)
+      .catch(err => console.error(`[${provider}] initiateCharge error:`, err));
+
+    // 6️⃣ Return immediately with pending status
+    return res.json(charge);
+
+  } catch (err) {
+    console.error('createCharge error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
-
-  if (provider === 'PROVIDER_ALPHA') {
-  const providerInstance = new ProviderAlpha();
-  providerInstance.initiateCharge(charge)
-    .catch(err => console.error('Alpha error:', err));
-}
-
-  if (provider === 'PROVIDER_BETA') {
-  const providerInstance = new ProviderBeta();
-  providerInstance.initiateCharge(charge)
-    .catch(err => console.error('Beta error:', err));
-}
-
-  return res.json(charge);
 };
 
+// ----------------------------
+// GET CHARGE STATUS
+// ----------------------------
 export const getChargeStatus = async (req, res) => {
-  const { requestId } = req.params;
+  try {
+    const { requestId } = req.params;
 
-  const charge = await db.get(
-    'SELECT * FROM charges WHERE requestId = ?',
-    requestId
-  );
+    const charge = await db.get(
+      'SELECT * FROM charges WHERE requestId = ?',
+      requestId
+    );
 
-  if (!charge) return res.status(404).json({ error: 'Charge not found' });
+    if (!charge) return res.status(404).json({ error: 'Charge not found' });
 
-  return res.json({
-    requestId: charge.requestId,
-    status: charge.status,
-    providerRef: charge.providerRef
-  });
+    return res.json({
+      requestId: charge.requestId,
+      status: charge.status,
+      providerRef: charge.providerRef,
+    });
+
+  } catch (err) {
+    console.error('getChargeStatus error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 };

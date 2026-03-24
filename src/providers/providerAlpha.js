@@ -1,3 +1,4 @@
+// providers/providerAlpha.js
 import fetch from 'node-fetch';
 import { db } from '../db/db.js';
 
@@ -14,19 +15,17 @@ export class ProviderAlpha {
         requestId: charge.requestId,
         amount: charge.amount,
         phoneNumber: charge.phoneNumber,
-        currency: charge.currency
-      })
+        currency: charge.currency,
+      }),
     });
 
     const data = await res.json();
 
-    // Save providerRef to DB
     await db.run(
       'UPDATE charges SET providerRef = ? WHERE requestId = ?',
       data.providerRef,
       charge.requestId
     );
-
-    return data;
+    // Final status arrives via webhook — no further action needed here
   }
 }

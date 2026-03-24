@@ -1,3 +1,4 @@
+// providers/providerBeta.js
 import fetch from 'node-fetch';
 import { db } from '../db/db.js';
 
@@ -14,49 +15,51 @@ export class ProviderBeta {
         requestId: charge.requestId,
         amount: charge.amount,
         phoneNumber: charge.phoneNumber,
-        currency: charge.currency
-      })
+        currency: charge.currency,
+      }),
     });
 
     const data = await res.json();
 
-    // Save providerRef
     await db.run(
       'UPDATE charges SET providerRef = ? WHERE requestId = ?',
       data.providerRef,
       charge.requestId
     );
 
-    // Start polling
-    this.pollStatus(data.providerRef);
+    // Polling runs in background — initiateCharge returns immediately
+    this._pollStatus(data.providerRef).catch(err =>
+      console.error('[ProviderBeta] pollStatus error:', err)
+    );
   }
 
-  async pollStatus(providerRef) {
-    let attempts = 0;
-    let delay = 1000; // start with 1 second
-    const maxAttempts = 5;
+  async _pollStatus(providerRef) {
+    const MAX_ATTEMPTS = 5;
+    let delay = 1000;
 
-    while (attempts < maxAttempts) {
+    for (let attempts = 0; attempts < MAX_ATTEMPTS; attempts++) {
       await new Promise(r => setTimeout(r, delay));
 
-      const res = await fetch(`${this.baseURL}/status/${providerRef}`);
-      const data = await res.json();
+      try {
+        const res = await fetch(`${this.baseURL}/status/${providerRef}`);
+        const data = await res.json();
 
-      if (data.status === 'successful' || data.status === 'failed') {
-        await db.run(
-          'UPDATE charges SET status = ? WHERE providerRef = ?',
-          data.status,
-          providerRef
-        );
-        return;
+        if (data.status === 'successful' || data.status === 'failed') {
+          await db.run(
+            'UPDATE charges SET status = ? WHERE providerRef = ?',
+            data.status,
+            providerRef
+          );
+          return;
+        }
+      } catch (err) {
+        console.error(`[ProviderBeta] poll attempt ${attempts + 1} failed:`, err);
       }
 
-      // exponential backoff
-      delay *= 2;
-      attempts++;
+      delay *= 2; // exponential backoff
     }
 
-    // timeout fallback
+    // Exhausted all attempts — mark as failed
     await db.run(
       'UPDATE charges SET status = ? WHERE providerRef = ?',
       'failed',

@@ -1,91 +1,204 @@
-Payments Service – Take-Home
-Overview
+# Payments Service
 
-This is a mini backend payments service for processing mobile money (MoMo) charges via two providers: PROVIDER_ALPHA (webhook-style) and PROVIDER_BETA (polling-style).
+A Node.js HTTP service for initiating and tracking mobile money (MoMo) charge requests through external payment providers.
 
-Key features:
+---
 
-Fast response: /charge endpoint responds immediately (<300ms) using async processing.
-Idempotency: Same requestId will never create duplicate charges.
-Durable storage: Charges are persisted in SQLite; survives process restarts.
-Extensible: Adding a new provider requires only a new provider class and registration.
+## How to Run Locally
 
-Tech Stack
+### Prerequisites
 
-Node.js v20+ (ESM modules)
-Express – HTTP server
-SQLite – Persistent storage for charges
-node-fetch – HTTP requests to providers
-npm – package management
+- Node.js v20+
+- npm
 
-Getting Started
+### 1. Install dependencies
 
-1. Clone and install dependencies
-git clone git@github.com:12siragi/payments-service.git
-cd payments-service
+```bash
 npm install
-2. Run stub servers (mock providers)
+```
+
+### 2. Start the provider stubs
 
 Open two separate terminals:
 
-ProviderAlpha (webhook)
+```bash
+# Terminal 1 — ProviderAlpha (webhook-based, port 4001)
+WEBHOOK_URL=http://localhost:3001/webhooks/provider-alpha node stubs/provider-alpha.js
 
-cd stubs
-WEBHOOK_URL=http://localhost:3001/webhooks/provider-alpha node provider-alpha.js
+# Terminal 2 — ProviderBeta (polling-based, port 4002)
+node stubs/provider-beta.js
+```
 
-ProviderBeta (polling)
+### 3. Start the service
 
-cd stubs
-node provider-beta.js
-3. Run the backend
-cd ../src
-node app.js
+```bash
+# Terminal 3
+node src/server.js
+```
 
-Server runs on http://localhost:3001
+Service runs on **http://localhost:3001**
 
-4. API Endpoints
+---
 
-Create charge
+## API Reference
 
+### Initiate a charge
+
+```
 POST /charge
-Content-Type: application/json
+```
 
-{
-  "amount": 100,
-  "phoneNumber": "+254700000000",
-  "currency": "KES",
-  "provider": "PROVIDER_ALPHA",
-  "requestId": "unique-id-123"
-}
+**Request body:**
 
-Get charge status
+| Field | Type | Description |
+|---|---|---|
+| `requestId` | string | Caller-supplied idempotency key |
+| `amount` | number | Charge amount (must be positive) |
+| `phoneNumber` | string | Target phone number |
+| `currency` | string | 3-letter currency code e.g. `KES` |
+| `provider` | string | `PROVIDER_ALPHA` or `PROVIDER_BETA` |
 
+**Response:** `200 OK` — charge object with `status: "pending"`
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:3001/charge \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requestId": "req-001",
+    "amount": 100,
+    "phoneNumber": "+254700000001",
+    "currency": "KES",
+    "provider": "PROVIDER_ALPHA"
+  }'
+```
+
+---
+
+### Check charge status
+
+```
 GET /charge/:requestId
+```
 
-Webhook endpoint (for ProviderAlpha)
+**Response:**
 
-POST /webhooks/provider-alpha
+```json
 {
-  "providerRef": "...",
-  "status": "successful" | "failed"
+  "requestId": "req-001",
+  "status": "successful",
+  "providerRef": "eb6187b3-65e0-4975-95bc-4e54aa027ea4"
 }
-5. Design Decisions
-Persistence: SQLite chosen for simplicity, durability, and fast local development.
-Async processing: Provider requests are initiated asynchronously; /charge responds immediately.
-Idempotency: requestId is unique; existing charge is returned if submitted twice.
-Provider extensibility: Each provider has a dedicated class. Adding a new provider requires only a new class and registration.
-6. Idempotency Test
-# First submission
-curl -X POST http://localhost:3001/charge -H "Content-Type: application/json" \
--d '{"amount":100,"phoneNumber":"+254700000000","currency":"KES","provider":"PROVIDER_BETA","requestId":"beta-test"}'
+```
 
-# Resubmission (same requestId)
-curl -X POST http://localhost:3001/charge -H "Content-Type: application/json" \
--d '{"amount":100,"phoneNumber":"+254700000000","currency":"KES","provider":"PROVIDER_BETA","requestId":"beta-test"}'
+Status is one of: `pending` · `successful` · `failed`
 
-# Result: same charge object returned, no duplicate charge created
-7. Future Improvements
-Add automatic exponential backoff retry for ProviderBeta in case of network failures.
-Add unit and integration tests for all providers.
-Replace SQLite with PostgreSQL or another production-grade DB.
-Add logging and monitoring for webhook and polling events.
+---
+
+### ProviderAlpha webhook (internal)
+
+```
+POST /webhooks/provider-alpha
+```
+
+Called automatically by ProviderAlpha stub. Updates charge status when the provider resolves.
+
+---
+
+## Key Design Decisions
+
+### 1. Async fire-and-forget — sub-300ms responses
+
+Provider API calls take 10–30 seconds. The HTTP handler inserts the charge as `pending`, fires the provider call without `await`, and returns immediately. The provider updates the DB in the background — via webhook (Alpha) or polling (Beta).
+
+This guarantees the endpoint always responds in well under 300ms regardless of provider latency.
+
+### 2. Idempotency via `requestId` unique constraint
+
+The `charges` table has a `UNIQUE` constraint on `requestId`. On every incoming request, the handler checks for an existing row first. If found, it returns the existing charge immediately without touching the provider. This means submitting the same `requestId` twice will never result in two charges — even under concurrent requests, SQLite's constraint acts as the final guard.
+
+### 3. SQLite for persistence
+
+SQLite was chosen because it requires zero infrastructure setup (no separate DB process), ships as an npm package, and fully satisfies the durability requirement — all charge state survives process restarts. For a production system handling high concurrency or horizontal scaling, PostgreSQL would be the appropriate replacement, with no changes required to application logic beyond the DB driver.
+
+### 4. Provider registry for extensibility
+
+Providers are registered in a single `providerRegistry.js` map:
+
+```js
+export const providerRegistry = {
+  PROVIDER_ALPHA: ProviderAlpha,
+  PROVIDER_BETA:  ProviderBeta,
+};
+```
+
+The HTTP layer and job processing logic never contain provider-specific branching. Adding a third provider requires only:
+1. A new provider class file implementing `initiateCharge(charge)`
+2. One line added to `providerRegistry.js`
+
+No changes to the controller, router, or webhook handler.
+
+### 5. ProviderBeta polling with exponential backoff
+
+Since ProviderBeta has no webhook, the service polls its status endpoint after initiating a charge. Polling starts at 1 second and doubles on each attempt (1s → 2s → 4s → 8s → 16s) up to 5 attempts. If no terminal status is received, the charge is marked `failed`. All polling runs in the background — it never blocks the HTTP response.
+
+---
+
+## Project Structure
+
+```
+payments-service/
+├── src/
+│   ├── server.js                  # Express app, routes, webhook handler
+│   ├── controllers/
+│   │   └── chargeController.js    # createCharge, getChargeStatus
+│   ├── providers/
+│   │   ├── providerRegistry.js    # Provider lookup map
+│   │   ├── providerAlpha.js       # Webhook-based provider
+│   │   └── providerBeta.js        # Polling-based provider
+│   └── db/
+│       └── db.js                  # SQLite connection + schema init
+├── stubs/
+│   ├── provider-alpha.js          # Mock ProviderAlpha server (port 4001)
+│   └── provider-beta.js           # Mock ProviderBeta server (port 4002)
+├── tests/
+│   └── chargeController.test.js   # Idempotency + integration tests
+└── README.md
+```
+
+---
+
+## Running Tests
+
+No extra dependencies needed — uses Node's built-in test runner:
+
+```bash
+node --test tests/chargeController.test.js
+```
+
+The test suite covers:
+
+- **Idempotency** — same `requestId` twice returns identical response, one DB row, provider called once
+- **Input validation** — missing fields, negative/zero/string amount
+- **Provider routing** — Alpha and Beta create pending charges; unknown provider returns 400 with no DB write
+- **Sub-300ms response** — slow provider injected; asserts HTTP response returns before provider resolves
+- **Status endpoint** — happy path and 404
+- **Webhook handler** — status update and unknown providerRef
+- **Error resilience** — broken DB returns 500; throwing provider doesn't crash the request
+
+---
+
+## What I Would Change With More Time
+
+**Job queue for background work** — the fire-and-forget pattern works but if the process crashes mid-flight the provider call is lost. A durable job queue (e.g. BullMQ + Redis, or a `jobs` table in SQLite) would survive restarts and support retries with backoff.
+
+**Webhook signature verification** — the ProviderAlpha webhook endpoint currently accepts any request. In production it should verify a shared secret or HMAC signature on each callback.
+
+**Structured logging** — replace `console.error` with a structured logger (e.g. `pino`) to get consistent JSON log lines with timestamps, requestId correlation, and log levels.
+
+**PostgreSQL for production** — SQLite is great for a single-process service but doesn't support concurrent writes well. A move to PostgreSQL would support horizontal scaling and is a drop-in swap at the driver level.
+
+**Request timeout on provider calls** — outbound `fetch` calls to providers have no timeout. A hung provider would leave the background task open indefinitely. Adding `AbortController` with a timeout would bound this.
+
+**Rate limiting and auth** — the API currently has no authentication or rate limiting. For a real payments endpoint both are essential.
